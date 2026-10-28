@@ -128,6 +128,7 @@
 <header>
     <h1>Faster · Occupancy Tracker</h1>
     <a href="{{ route('occupancy.index') }}">Occupancy</a>
+    <a href="{{ route('changes.index') }}">Changes</a>
     <div class="spacer"></div>
     @auth
         <span class="small">{{ auth()->user()->name }}</span>

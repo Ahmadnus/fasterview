@@ -1,10 +1,11 @@
-# Faster — Vehicle Occupancy Tracker (Phase 1)
+# Faster — Vehicle Occupancy Tracker (Phases 1–2)
 
 Pulls occupancy and page-view data from Power BI on every refresh, stores each
 pull as a dated snapshot, and shows the history in a sortable table.
 
-Phase 1 is **infrastructure only**: pull, store, display. No ranking logic and no
-rank-change tracking yet — those sit on top of this later.
+Phase 1 is **infrastructure only**: pull, store, display.
+Phase 2 adds **automatic rank/price change detection** and a `/changes` page that
+shows what happened to a car either side of a change, against its category.
 
 ## Location
 
@@ -28,6 +29,10 @@ MySQL runs under XAMPP; start it from the XAMPP control panel before syncing.
 | `php artisan powerbi:sync` | Refresh Power BI, wait, pull, store a snapshot |
 | `php artisan powerbi:sync --skip-refresh` | Pull current data without triggering a refresh (~20s) |
 | `php artisan powerbi:sync --dry-run` | Pull and summarise, write nothing |
+| `php artisan changes:detect` | Compare the latest two snapshots and log changes (runs automatically in every sync) |
+| `php artisan changes:detect --all --fresh` | Replay detection over all history. `--force`, `--dry-run` |
+| `php artisan changes:backfill-ranks` | Import dated rank history from RankPublished API. `--dry-run`, `--fresh`, `--since=` |
+| `php artisan ga4:inspect-clicks` | Explore what GA4 click events exist and whether they name a car |
 
 ## Where the data comes from
 
@@ -95,6 +100,71 @@ stay NULL — "unknown" is never displayed as "lent".
 **Price** uses `sale_price`, falling back to `price` — the sampled `price`
 column reads 0 while `sale_price` holds the live rate.
 
+## Phase 2 — change detection
+
+`ChangeDetector` runs at the end of every `powerbi:sync`. It compares the
+snapshot just written against the previous one and writes a `change_events` row
+for every rank or price move. It reads only `occupancy_snapshots`, so it is safe
+to replay and can never corrupt a pull.
+
+**Grain differs by type, on purpose.** Rank is per car per category. Price is
+per car with a NULL category — price repeats across a car's category rows, so
+recording it per category would turn one Escalade price cut into four identical
+events.
+
+**Rejection is based on proven staleness, not volume.** If the sync recorded the
+`RANKS IN THIS SNAPSHOT MAY BE STALE` warning (the live-API fallback fired), its
+rank changes are discarded rather than written as real decisions. Volume alone is
+deliberately *not* a criterion: a 2026-08-28 run with a healthy API moved 492 of
+1075 ranks (46%) across an 8-day gap, and those were genuine. A high share only
+prints a note. `--force` overrides.
+
+Cars appearing or disappearing between snapshots are not logged — that is fleet
+movement, not a change — but the count is surfaced as a warning.
+
+### Where rank history comes from
+
+Diffing our own snapshots can only date a change to *somewhere between two
+syncs* — an 8-day gap dates it to within 8 days — and it reaches back no further
+than the first snapshot. `RankPublished API` records every ranking publication
+with its own `published_at`, `prev_rank` and `delta_vs_prev`: **5,597 usable
+moves back to 2026-07-11**, dated to the minute.
+
+`changes:backfill-ranks` imports them with `source = 'rank_api'`. Two wrinkles
+it handles: the ranking surfaces were renamed partway through (`SUV Car` and
+`Rent SUV` both appear, mapped via `SURFACE_ALIASES`), and the table also carries
+internal surfaces that are not website categories at all (`flash_sale`,
+`brand:7`) which are skipped and counted.
+
+This matters because the before/after comparison needs changes whose after-window
+has already closed. Without the backfill the page can only show *in window* until
+a week of history accumulates.
+
+Price is not backfilled — `RankPublished API` carries no price, so price changes
+come only from snapshot diffing.
+
+## Conversions, and the `daily_clicks` table that isn't
+
+A 2026-08-29 scan of all 109 dataset tables found **no per-car click breakdown**.
+`ga4_Events` carries `click`, `Call`, `select_item` and `popup_click`, but at one
+row per event per day with no car identifier — site-wide only. There is no
+WhatsApp event at all (`Customers[Whatsapp]` is a phone-number field).
+
+The only click-shaped signal that resolves to a single car is `keyEvents` in
+`ga4_PagesAndScreens` — the table daily views already come from. It is stored as
+`daily_views.key_events`, at the same grain, costing one extra column in the
+existing DAX rather than a second table and a second query.
+
+It is **sparse**: over 2026-07-29..08-26, 213 of 358 cars recorded zero and only
+7.3% of car-days were non-zero. The page therefore suppresses a growth percentage
+when the before-window holds fewer than
+`ChangeImpactAnalyser::MIN_CONVERSIONS_FOR_GROWTH` conversions — 0 → 1 is not a
+100% improvement. The category average is what makes the metric usable, because
+aggregating a category's cars clears the noise floor a single car cannot.
+
+Rows synced before the column existed are NULL, not 0, so "not measured" never
+reads as "no conversions".
+
 ## The page
 
 `/occupancy` — one row per car per category, with **views sitting directly
@@ -107,6 +177,23 @@ conversion problem rather than a demand problem.
 
 "Pull Now" runs the fast path (no Power BI refresh). "Full Power BI refresh"
 triggers a refresh and waits, which can take several minutes.
+
+`/changes` — every detected rank and price change, with views, conversions and
+occupancy summed over the N days before and after it, beside **the average
+movement of the other cars in the same category over the identical window**.
+That control column is the point: a car rising while its whole category rises is
+not evidence the change worked. Green means the car beat its category by
+`ChangeImpactAnalyser::WIN_THRESHOLD`, red means it trailed by `LOSS_THRESHOLD`;
+both are named constants, adjustable in one place.
+
+Keeping views, conversions and occupancy as three separate columns is deliberate:
+rising views with flat conversions points at price or photos, while rising
+conversions with flat occupancy points at what happens after the enquiry.
+
+**A window is "complete" when the data covers it, not when the calendar passes
+it.** GA4 lands about two days behind, so a row whose after-window has elapsed on
+the clock but not in the data shows *in window* rather than a fabricated collapse
+to zero.
 
 ## Scheduling
 

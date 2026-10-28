@@ -6,6 +6,7 @@ use App\Models\DailyStatus;
 use App\Models\DailyView;
 use App\Models\OccupancySnapshot;
 use App\Models\RefreshLog;
+use App\Services\ChangeDetector;
 use App\Services\OccupancyDataPuller;
 use App\Services\PowerBiException;
 use App\Services\PowerBiService;
@@ -84,6 +85,11 @@ class PowerBiSync extends Command
                 $this->storeDailyViews($dailyViews);
                 $this->storeDailyStatus($dailyStatus);
 
+                // Detection runs inside every sync so a rank or price move is
+                // never missed for want of a manual step. It only reads
+                // snapshots, so a failure here must not lose the pull.
+                $warnings = array_merge($warnings, $this->detectChanges($snapshotAt));
+
                 $log->update([
                     'completed_at' => CarbonImmutable::now(),
                     'status' => RefreshLog::STATUS_COMPLETED,
@@ -110,6 +116,41 @@ class PowerBiSync extends Command
             ]);
 
             return self::FAILURE;
+        }
+    }
+
+    /**
+     * Compare the snapshot just written against the previous one and record
+     * any rank or price changes.
+     *
+     * Wrapped so a detection fault can never fail a sync that already stored
+     * its data successfully — the snapshot is the irreplaceable part, and
+     * detection can always be replayed later with the changes:detect --all command.
+     *
+     * @return list<string>
+     */
+    private function detectChanges(CarbonImmutable $snapshotAt): array
+    {
+        try {
+            $result = (new ChangeDetector)->detectFor($snapshotAt->toDateTimeString());
+
+            $this->info(sprintf(
+                'Change detection: %d rank, %d price (%d rows compared).',
+                $result['rank'],
+                $result['price'],
+                $result['compared']
+            ));
+
+            foreach ($result['warnings'] as $warning) {
+                $this->warn('  ! '.$warning);
+            }
+
+            return $result['warnings'];
+        } catch (Throwable $e) {
+            $this->error('Change detection failed (the snapshot was still stored): '.$e->getMessage());
+            Log::error('change detection failed', ['exception' => $e]);
+
+            return ['Change detection failed: '.$e->getMessage()];
         }
     }
 
@@ -174,7 +215,7 @@ class PowerBiSync extends Command
         ], $dailyViews);
 
         foreach (array_chunk($payload, 500) as $chunk) {
-            DailyView::upsert($chunk, ['car_serial', 'view_date'], ['views', 'slug', 'updated_at']);
+            DailyView::upsert($chunk, ['car_serial', 'view_date'], ['views', 'key_events', 'slug', 'updated_at']);
         }
     }
 

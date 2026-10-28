@@ -373,7 +373,8 @@ class OccupancyDataPuller
             ),
             'ga4_PagesAndScreens'[slug],
             'ga4_PagesAndScreens'[_DATA_DATE],
-            "views", SUM('ga4_PagesAndScreens'[screenPageViews])
+            "views", SUM('ga4_PagesAndScreens'[screenPageViews]),
+            "keyEvents", SUM('ga4_PagesAndScreens'[keyEvents])
         )
         DAX, $from->year, $from->month, $from->day);
 
@@ -408,10 +409,17 @@ class OccupancyDataPuller
                     'slug' => $slug,
                     'view_date' => $day,
                     'views' => 0,
+                    'key_events' => 0,
                 ];
             }
 
             $totals[$key]['views'] += (int) $this->val($row, 'views');
+
+            // GA4's conversion count for the page. It arrives as a float
+            // (e.g. 4.0) and is the only click-shaped signal that resolves to
+            // a single car — the click/Call/select_item events in ga4_Events
+            // are site-wide with no car identifier.
+            $totals[$key]['key_events'] += (int) round((float) $this->val($row, 'keyEvents'));
         }
 
         if ($unmapped !== []) {
